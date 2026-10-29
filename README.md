@@ -6,4 +6,5 @@ the needed information inside.
 
 I sugest cloning the repository in one location, and then
 you will have access to all the tools and scripts that are
-contained herein.
+contained herein. However, each script can be downloaded
+separately if you do not wish the clone the repository.
