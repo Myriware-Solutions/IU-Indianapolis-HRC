@@ -1,0 +1,18 @@
+# Map each CSV Type number to a display label and any Matplotlib-compatible
+# color (hex, named color, etc.). Type and Slice are expected to match.
+
+[types."1"]
+label = "Dapi"
+color = "#e41a1c"
+
+[types."2"]
+label = "CD68"
+color = "#377eb8"
+
+[types."3"]
+label = "CD206"
+color = "#4daf4a"
+
+[types."4"]
+label = "Iba1"
+color = "#984ea3"
