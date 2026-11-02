@@ -55,9 +55,9 @@ NAMED_COLORS = {
 }
 
 
-def parse_colors(text):
+def parse_colors(text:str) -> list[tuple[int,...]]:
     """'blue,red' or '#0000ff,#ff0000' -> [(r,g,b), ...]"""
-    out = []
+    out:list[tuple[int,...]] = []
     for tok in text.split(","):
         tok = tok.strip().lower()
         if tok in NAMED_COLORS:
@@ -69,17 +69,18 @@ def parse_colors(text):
     return out
 
 
-def channel_colors(f, n):
+def channel_colors(f:nd2.ND2File, n):
     """Per-channel display colors (R, G, B) from the ND2 metadata.
     Falls back to a default palette (grayscale if there is one channel)."""
     try:
         cols = []
+        assert f.metadata.channels
         for ch in f.metadata.channels[:n]:
             meta = ch.channel
             if hasattr(meta, "color"):  # current nd2 versions: Color(r,g,b,a)
                 col = (int(meta.color.r), int(meta.color.g), int(meta.color.b))
             else:  # older nd2 versions: packed 0x00BBGGRR integer
-                c = int(meta.colorRGB)
+                c = int(meta.colorRGB) #type:ignore
                 col = (c & 255, (c >> 8) & 255, (c >> 16) & 255)
             cols.append(col if any(col) else (255, 255, 255))
         if len(cols) == n:
@@ -208,7 +209,7 @@ def process_file(path: Path, outdir: Path, overwrite: bool,
                     print(f"  wrote {tout.name}  shape={rgb[t].shape} (8-bit RGB)")
                 continue
 
-            kwargs = {"compression": "zlib"}
+            kwargs:dict[str,str|tuple|bool|dict] = {"compression": "zlib"}
             if order == ["T", "C", "Y", "X"]:
                 meta = {"axes": "TCYX"}
                 kwargs["imagej"] = True
@@ -220,7 +221,7 @@ def process_file(path: Path, outdir: Path, overwrite: bool,
                 kwargs["resolution"] = (1.0 / px_x, 1.0 / px_y)
                 kwargs["resolutionunit"] = "MICROMETER"
 
-            tifffile.imwrite(str(out), arr, **kwargs)
+            tifffile.imwrite(str(out), arr, **kwargs) #type:ignore
             print(f"  wrote {out.name}  shape={arr.shape} axes={''.join(order)}")
 
 
@@ -276,3 +277,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Author(s): Claude [AI], Anthony Smith
