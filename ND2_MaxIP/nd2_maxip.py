@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
 """
-nd2_maxip.py - Split Nikon .nd2 multipoint z-stacks into per-point
-max-intensity projections and save each as a TIFF.
+nd2_maxip.py - Split Nikon .nd2 multipoint z-stacks into per-position
+max-intensity projections (max-IP) and save them in the format you choose.
 
 Install:
     pip install nd2 tifffile numpy dask
 
-Usage:
-    python nd2_maxip.py file.nd2
-    python nd2_maxip.py folder_of_nd2s -o output_dir
-    python nd2_maxip.py a.nd2 b.nd2 -o out --overwrite
-    python nd2_maxip.py file.nd2 --simple              # 8-bit RGB for Windows/PowerPoint
+Usage (--mode is required):
+    python nd2_maxip.py file.nd2 --mode simple
+    python nd2_maxip.py folder_of_nd2s --mode multi-max -o output_dir
+    python nd2_maxip.py a.nd2 b.nd2 --mode one-max --overwrite
 
-Output: <output_dir>/<nd2 name>_P001_<position name>.tif, _P002_<name>.tif, ...
-(the position name is the one set in NIS-Elements; characters that Windows
-does not allow in file names are replaced with underscores)
-Each TIFF is an ImageJ-compatible hyperstack (axes T, C, Y, X) with
-pixel size (um) stored, so it opens with correct scaling in Fiji.
+Modes:
+    simple      8-bit color RGB TIFF for presentations (one per position),
+                channels tinted with their ND2 colors.
+    one-max     One intensity TIFF per position: max-IP over Z and over all
+                channels (original bit depth).
+    multi-max   One intensity TIFF per position per channel: max-IP over Z
+                (original bit depth).
+    as-nd2      One file per .nd2 with every position and channel kept
+                separate, only Z removed. ND2 files cannot be written by any
+                available library, so this is saved as an OME-TIFF
+                (<name>_maxip.ome.tif), which Fiji/ImageJ and Bio-Formats
+                based tools open with the positions as separate series.
+
+File names:
+    <index>_<nd2 name>_P<position #>_<position name>[_C<channel #>_<channel name>].tif
+    <index> counts every output file in the run (0001, 0002, ...), so names
+    never collide and you can see progress. Characters Windows does not allow
+    in file names are replaced with underscores.
 """
 import argparse
+import itertools
 import sys
 from pathlib import Path
 
@@ -55,9 +68,9 @@ NAMED_COLORS = {
 }
 
 
-def parse_colors(text:str) -> list[tuple[int,...]]:
+def parse_colors(text):
     """'blue,red' or '#0000ff,#ff0000' -> [(r,g,b), ...]"""
-    out:list[tuple[int,...]] = []
+    out = []
     for tok in text.split(","):
         tok = tok.strip().lower()
         if tok in NAMED_COLORS:
@@ -69,18 +82,17 @@ def parse_colors(text:str) -> list[tuple[int,...]]:
     return out
 
 
-def channel_colors(f:nd2.ND2File, n):
+def channel_colors(f, n):
     """Per-channel display colors (R, G, B) from the ND2 metadata.
     Falls back to a default palette (grayscale if there is one channel)."""
     try:
         cols = []
-        assert f.metadata.channels
         for ch in f.metadata.channels[:n]:
             meta = ch.channel
             if hasattr(meta, "color"):  # current nd2 versions: Color(r,g,b,a)
                 col = (int(meta.color.r), int(meta.color.g), int(meta.color.b))
             else:  # older nd2 versions: packed 0x00BBGGRR integer
-                c = int(meta.colorRGB) #type:ignore
+                c = int(meta.colorRGB)
                 col = (c & 255, (c >> 8) & 255, (c >> 16) & 255)
             cols.append(col if any(col) else (255, 255, 255))
         if len(cols) == n:
@@ -147,9 +159,51 @@ def safe_name(name, max_len=80):
     return cleaned.strip("._")[:max_len]
 
 
-def process_file(path: Path, outdir: Path, overwrite: bool,
-                 simple: bool = False, lo_pct: float = 0.5,
-                 hi_pct: float = 99.8, override_colors=None):
+def channel_names(f, n):
+    """Channel names from the ND2 metadata ('' where missing)."""
+    names = []
+    try:
+        names = [(ch.channel.name or "") for ch in f.metadata.channels[:n]]
+    except Exception as e:
+        print(f"  WARNING: could not read channel names ({e!r})")
+    return names + [""] * (n - len(names))
+
+
+def build_name(idx, stem, p, pos_name, ch=None, ch_name="", t=None,
+               suffix=""):
+    """<idx>_<stem>_P001[_<pos name>][_C1[_<ch name>]][_T001][suffix].tif"""
+    parts = [f"{idx:04d}", stem, f"P{p + 1:03d}"]
+    if safe_name(pos_name):
+        parts.append(safe_name(pos_name))
+    if ch is not None:
+        parts.append(f"C{ch + 1}")
+        if safe_name(ch_name):
+            parts.append(safe_name(ch_name))
+    if t is not None:
+        parts.append(f"T{t + 1:03d}")
+    return "_".join(parts) + suffix + ".tif"
+
+
+def write_intensity(path, arr, px_x, px_y, has_s=False):
+    """arr is (T, Y, X), or (T, Y, X, S) when has_s. Original bit depth.
+    One timepoint -> plain 2D image; several -> a time stack. Opens in
+    Fiji/ImageJ with pixel size in um."""
+    if arr.shape[0] == 1:
+        arr = arr[0]
+    res = {}
+    if px_x and px_y:
+        res = {"resolution": (1.0 / px_x, 1.0 / px_y)}
+    if has_s:  # camera RGB data: plain RGB TIFF
+        tifffile.imwrite(str(path), arr, photometric="rgb",
+                         resolutionunit="MICROMETER" if res else None, **res)
+    else:
+        tifffile.imwrite(str(path), arr, imagej=True,
+                         metadata={"unit": "um"} if res else {}, **res)
+
+
+def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
+                 counter, lo_pct: float = 0.5, hi_pct: float = 99.8,
+                 override_colors=None):
     outdir.mkdir(parents=True, exist_ok=True)
     with nd2.ND2File(str(path)) as f:
         dims = list(f.sizes.keys())  # e.g. ['P','T','Z','C','Y','X']
@@ -163,88 +217,139 @@ def process_file(path: Path, outdir: Path, overwrite: bool,
             px_x = px_y = None
 
         n_points = f.sizes.get("P", 1)
-        names = position_names(f, n_points)
-        for p in range(n_points):
-            suffix = "_rgb" if simple else ""
-            label = safe_name(names[p])
-            label = f"_{label}" if label else ""
-            out = outdir / f"{path.stem}_P{p + 1:03d}{label}{suffix}.tif"
-            if out.exists() and not overwrite:
-                print(f"  skip {out.name} (exists; use --overwrite)")
-                continue
+        n_t = f.sizes.get("T", 1)
+        n_c = f.sizes.get("C", 1)
+        pos_names = position_names(f, n_points)
+        ch_names = channel_names(f, n_c)
 
-            sub, sub_dims = data, dims[:]
-            if "P" in sub_dims:
-                pi = sub_dims.index("P")
-                sub = sub[(slice(None),) * pi + (p,)]
-                sub_dims.pop(pi)
+        writer = None
+        if mode == "as-nd2":
+            ome_out = outdir / f"{next(counter):04d}_{path.stem}_maxip.ome.tif"
+            if ome_out.exists() and not overwrite:
+                print(f"  skip {ome_out.name} (exists; use --overwrite)")
+                return
+            writer = tifffile.TiffWriter(str(ome_out), ome=True, bigtiff=True)
 
-            # Max intensity projection along Z
-            if "Z" in sub_dims:
-                zi = sub_dims.index("Z")
-                sub = sub.max(axis=zi)
-                sub_dims.pop(zi)
+        try:
+            for p in range(n_points):
+                # ---- plan the output files for this position ----------
+                jobs = []  # (out path, kind, index)
+                if mode == "simple":
+                    for t in range(n_t):
+                        jobs.append((outdir / build_name(
+                            next(counter), path.stem, p, pos_names[p],
+                            t=t if n_t > 1 else None, suffix="_rgb"),
+                            "simple", t))
+                elif mode == "one-max":
+                    jobs.append((outdir / build_name(
+                        next(counter), path.stem, p, pos_names[p],
+                        suffix="_maxall"), "one", None))
+                elif mode == "multi-max":
+                    for c in range(n_c):
+                        jobs.append((outdir / build_name(
+                            next(counter), path.stem, p, pos_names[p],
+                            ch=c, ch_name=ch_names[c], suffix="_max"),
+                            "multi", c))
 
-            arr = np.asarray(sub.compute())
-            arr, order = reorder(arr, sub_dims)
+                todo = []
+                for job in jobs:
+                    if job[0].exists() and not overwrite:
+                        print(f"  skip {job[0].name} (exists; use --overwrite)")
+                    else:
+                        todo.append(job)
+                if mode != "as-nd2" and not todo:
+                    continue
 
-            if simple:
-                # 8-bit RGB, uncompressed, one page: opens in Windows,
-                # PowerPoint, etc. One file per timepoint if T > 1.
-                n_c = arr.shape[order.index("C")]
-                colors = override_colors or channel_colors(f, n_c)
-                if len(colors) < n_c:
-                    raise ValueError(f"--colors gave {len(colors)} colors "
-                                     f"but the file has {n_c} channels")
-                rgb = make_rgb(arr, order, colors, lo_pct, hi_pct)
-                res = {}
-                if px_x and px_y:
-                    res = {"resolution": (1.0 / px_x, 1.0 / px_y),
-                           "resolutionunit": "MICROMETER"}
-                for t in range(rgb.shape[0]):
-                    tout = out if rgb.shape[0] == 1 else out.with_name(
-                        f"{out.stem}_T{t + 1:03d}.tif")
-                    tifffile.imwrite(str(tout), rgb[t], photometric="rgb",
-                                     **res)
-                    print(f"  wrote {tout.name}  shape={rgb[t].shape} (8-bit RGB)")
-                continue
+                # ---- max-IP over Z for this position -------------------
+                sub, sub_dims = data, dims[:]
+                if "P" in sub_dims:
+                    pi = sub_dims.index("P")
+                    sub = sub[(slice(None),) * pi + (p,)]
+                    sub_dims.pop(pi)
+                if "Z" in sub_dims:
+                    zi = sub_dims.index("Z")
+                    sub = sub.max(axis=zi)
+                    sub_dims.pop(zi)
 
-            kwargs:dict[str,str|tuple|bool|dict] = {"compression": "zlib"}
-            if order == ["T", "C", "Y", "X"]:
-                meta = {"axes": "TCYX"}
-                kwargs["imagej"] = True
-                if px_x and px_y:
-                    kwargs["resolution"] = (1.0 / px_x, 1.0 / px_y)
-                    meta["unit"] = "um"
-                kwargs["metadata"] = meta
-            elif px_x and px_y:
-                kwargs["resolution"] = (1.0 / px_x, 1.0 / px_y)
-                kwargs["resolutionunit"] = "MICROMETER"
+                arr = np.asarray(sub.compute())
+                arr, order = reorder(arr, sub_dims)  # T, C, Y, X [, S]
+                if order not in (["T", "C", "Y", "X"],
+                                 ["T", "C", "Y", "X", "S"]):
+                    raise ValueError(f"unexpected axes {order} after max-IP")
 
-            tifffile.imwrite(str(out), arr, **kwargs) #type:ignore
-            print(f"  wrote {out.name}  shape={arr.shape} axes={''.join(order)}")
+                # ---- write -----------------------------------------------
+                if mode == "as-nd2":
+                    meta = {"axes": "".join(order),
+                            "Name": (f"P{p + 1:03d}_{pos_names[p]}"
+                                     if pos_names[p] else f"P{p + 1:03d}"),
+                            "Channel": {"Name": [
+                                f"C{c + 1}" + (f"_{n}" if n else "")
+                                for c, n in enumerate(ch_names)]}}
+                    if px_x and px_y:
+                        meta.update(PhysicalSizeX=px_x, PhysicalSizeY=px_y,
+                                    PhysicalSizeXUnit="µm",
+                                    PhysicalSizeYUnit="µm")
+                    writer.write(arr, metadata=meta, contiguous=False)
+                    print(f"  added position {p + 1}/{n_points} "
+                          f"({meta['Name']}) shape={arr.shape}")
+                    continue
+
+                for out, kind, k in todo:
+                    if kind == "simple":
+                        colors = override_colors or channel_colors(f, n_c)
+                        if len(colors) < n_c:
+                            raise ValueError(
+                                f"--colors gave {len(colors)} colors but "
+                                f"the file has {n_c} channels")
+                        rgb = make_rgb(arr, order, colors, lo_pct, hi_pct)
+                        res = {}
+                        if px_x and px_y:
+                            res = {"resolution": (1.0 / px_x, 1.0 / px_y),
+                                   "resolutionunit": "MICROMETER"}
+                        tifffile.imwrite(str(out), rgb[k], photometric="rgb",
+                                         **res)
+                        print(f"  wrote {out.name}  shape={rgb[k].shape} "
+                              "(8-bit RGB)")
+                    else:
+                        img = (arr.max(axis=1) if kind == "one"
+                               else arr[:, k])        # (T, Y, X[, S])
+                        write_intensity(out, img, px_x, px_y, "S" in order)
+                        print(f"  wrote {out.name}  shape={img.shape} "
+                              f"dtype={img.dtype}")
+        finally:
+            if writer is not None:
+                writer.close()
+                print(f"  wrote {ome_out.name}")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="+", help=".nd2 files and/or folders")
+    ap.add_argument("--mode", required=True,
+                    choices=["simple", "one-max", "multi-max", "as-nd2"],
+                    help="REQUIRED. simple: color RGB for presentations; "
+                         "one-max: one intensity TIFF per position (all "
+                         "channels combined); multi-max: one intensity TIFF "
+                         "per position per channel; as-nd2: one multi-"
+                         "position, multi-channel file per .nd2 (OME-TIFF)")
     ap.add_argument("-o", "--outdir", default=None,
                     help="output folder (default: next to each input file)")
     ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--simple", action="store_true",
-                    help="save plain 8-bit RGB color TIFFs (<name>_P001_rgb.tif) "
-                         "readable by Windows/PowerPoint; channels are "
-                         "contrast-stretched and tinted with their ND2 colors")
     ap.add_argument("--low", type=float, default=0.5,
-                    help="--simple: low contrast percentile (default 0.5)")
+                    help="simple mode: low contrast percentile (default 0.5)")
     ap.add_argument("--high", type=float, default=99.8,
-                    help="--simple: high contrast percentile (default 99.8)")
+                    help="simple mode: high contrast percentile (default 99.8)")
     ap.add_argument("--colors", default=None,
-                    help="--simple: override channel colors, in channel "
+                    help="simple mode: override channel colors, in channel "
                          "order, e.g. blue,red or '#0000ff,#ff0000'. Names: "
                          + ", ".join(NAMED_COLORS))
     args = ap.parse_args()
+
+    if args.mode != "simple" and (args.colors or args.low != 0.5
+                                  or args.high != 99.8):
+        print("Note: --colors/--low/--high only apply to --mode simple.",
+              file=sys.stderr)
 
     override = None
     if args.colors:
@@ -266,10 +371,11 @@ def main():
     if not files:
         sys.exit("No .nd2 files found.")
 
+    counter = itertools.count(1)  # overall output-file index for the run
     for fp in files:
         outdir = Path(args.outdir) if args.outdir else fp.parent
         try:
-            process_file(fp, outdir, args.overwrite, args.simple,
+            process_file(fp, outdir, args.overwrite, args.mode, counter,
                          args.low, args.high, override)
         except Exception as e:
             print(f"ERROR processing {fp.name}: {e}", file=sys.stderr)
@@ -277,5 +383,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# Author(s): Claude [AI], Anthony Smith
