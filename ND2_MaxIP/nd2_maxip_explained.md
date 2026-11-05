@@ -49,7 +49,7 @@ So one file might hold `12 × 1 × 30 × 2 × 2048 × 2048` numbers.
 3. **Max-IP** (maximum intensity projection): flatten the `Z` axis by keeping
    only the *brightest value at each pixel across all Z slices*. A 30-slice
    stack becomes one flat image.
-4. **Save** the result, in one of four formats chosen by `--mode`.
+4. **Save** the result, in one of five formats chosen by `--mode`.
 
 ### Why "maximum"? A tiny example
 
@@ -58,7 +58,7 @@ Imagine one pixel position viewed through 4 Z-slices, with brightness values
 the image and you get a flat picture showing the brightest structure at every
 spot, regardless of which slice it sat in.
 
-### The four modes
+### The five modes
 
 | Mode | Output | What is combined |
 |---|---|---|
@@ -66,6 +66,7 @@ spot, regardless of which slice it sat in.
 | `one-max` | grayscale, 1 per position | Z (max) **and** channels (max) |
 | `multi-max` | grayscale, 1 per position **per channel** | Z (max) only |
 | `as-nd2` | one multi-position, multi-channel file per `.nd2` | Z (max) only |
+| `as-nd2-color` | same as `as-nd2`, plus each channel's display color stored in the file | Z (max) only |
 
 ---
 
@@ -102,6 +103,7 @@ python nd2_maxip.py file.nd2 --mode multi-max
         │
         ├── position_names()      read position names
         ├── channel_names()       read channel names
+        ├── ome_color()           (as-nd2-color) pack a color for the OME metadata
         ├── build_name()          make an output file name
         │       └── safe_name()   clean text so Windows accepts it
         ├── reorder()             put axes in a known order
@@ -149,6 +151,8 @@ lines from the file.
 | `%` | remainder after division (modulo). Used to "wrap around" a list. | `i % len(DEFAULT_COLORS)` |
 | `&` | **bitwise AND**: compares numbers bit by bit (see "Bit tricks" below) | `c & 255` |
 | `>>` | **bit shift right**: slides the bits over | `(c >> 8) & 255` |
+| `<<` | **bit shift left**: slides the bits the other way (multiplies by 2 each step) | `r << 24` |
+| `\|` | **bitwise OR**: combines the bits of two numbers (used to pack values together) | `(r << 24) \| (g << 16)` |
 
 ### Logic words
 
@@ -276,7 +280,11 @@ for pt in loop.parameters.points:
     names.append(pt.name or "")
 ```
 The `tuple(... for i in (1, 3, 5))` in `parse_colors` is the same idea,
-turned into a tuple.
+turned into a tuple. Written *without* square brackets like this, a loop
+expression is called a **generator expression**: it produces the items one at
+a time and is handed straight to whatever function wraps it, e.g.
+`r, g, b = (int(v) for v in rgb)` in `ome_color` converts each of the three
+color values to a whole number and unpacks them into three names.
 
 **Conditional expression** (a one-line `if/else`):
 ```python
@@ -307,6 +315,11 @@ col = (c & 255, (c >> 8) & 255, (c >> 16) & 255)
 Example: the number `0x00FF8040` gives `(64, 128, 255)` (R, G, B). Newer
 `nd2` versions give the color already separated (`meta.color.r/.g/.b`), so
 that branch is only a fallback.
+
+`ome_color` does the **reverse** (packing) with `<<` and `|`: shifting a
+value left by 24 bits moves it into the top byte, by 16 into the second byte,
+and so on. `|` then merges the pieces into one number. See the `ome_color`
+walkthrough in Part 5.
 
 ### Built-in functions and list methods
 
@@ -494,6 +507,13 @@ DEFAULT_COLORS = [(0, 0, 255), (0, 255, 0), (255, 0, 0), ...]
 ```
 A fallback list of `(R, G, B)` colors, each value 0 to 255: blue, green, red,
 magenta, cyan, yellow. Used only if the file's own colors cannot be read.
+
+```python
+OME_MODES = ("as-nd2", "as-nd2-color")
+```
+A **tuple** of the two mode names that write an OME-TIFF. Later the code asks
+`mode in OME_MODES` instead of repeating both names everywhere. Defining it
+once means a future OME mode only needs adding in one place.
 
 ```python
 NAMED_COLORS = {"red": (255, 0, 0), ...}
@@ -707,6 +727,41 @@ Verified: `safe_name("ctrl/2: x?")` gives `ctrl_2__x`;
 
 ---
 
+### `ome_color(rgb)`
+
+**Purpose:** convert an `(R, G, B)` color into the single number the OME
+metadata format uses to store a channel's color (`as-nd2-color` mode).
+
+```python
+r, g, b = (int(v) for v in rgb)
+v = (r << 24) | (g << 16) | (b << 8) | 255
+return v - (1 << 32) if v >= (1 << 31) else v
+```
+
+1. Unpack the three values (red, green, blue).
+2. **Pack** them into one 32-bit number, one byte each:
+   `RRRRRRRR GGGGGGGG BBBBBBBB AAAAAAAA`. The last byte, `255`, is "alpha"
+   (opacity), meaning fully opaque. `<< 24` moves red into the top byte,
+   `<< 16` green into the second, `<< 8` blue into the third, and `|` merges
+   them.
+3. OME stores this as a **signed** 32-bit integer, which can be negative. Any
+   number at or above `1 << 31` (2,147,483,648, i.e. the top bit is set) is
+   converted by subtracting `1 << 32` (4,294,967,296).
+   `x if condition else y` is the one-line if/else described in Part 3.
+
+Verified results:
+
+| Color | `ome_color(...)` |
+|---|---|
+| blue `(0, 0, 255)` | `65535` |
+| red `(255, 0, 0)` | `-16776961` |
+| green `(0, 255, 0)` | `16711935` |
+
+A viewer such as Fiji (through Bio-Formats) reverses this to recover the
+colors.
+
+---
+
 ### `channel_names(f, n)`
 
 Same pattern as `position_names`, for channel names. Note the last line:
@@ -771,14 +826,16 @@ trace. In outline:
 1. `outdir.mkdir(...)`: make sure the output folder exists.
 2. `with nd2.ND2File(str(path)) as f:`: open the file (auto-closes).
 3. Read dimensions, the lazy data array, pixel size, names.
-4. `as-nd2` only: open one output writer for the whole file.
+4. `as-nd2` / `as-nd2-color` only (`ome_mode`): open one output writer for
+   the whole file. In `as-nd2-color` the channel colors are looked up first
+   (from the file, or from `--colors`) and stored alongside the channel names.
 5. `for p in range(n_points):`
    * **Plan** which files this position needs (`jobs`) and drop the ones that
      exist already (unless `--overwrite`).
    * **Reduce:** slice out position `p`, max over `Z`, `.compute()`.
    * **Reorder** to `T, C, Y, X`.
    * **Write** according to the mode.
-6. `finally:` close the `as-nd2` writer.
+6. `finally:` close the OME writer.
 
 ### `main()`: the command-line entry point
 
@@ -818,8 +875,10 @@ Key ideas:
   axis it described is now gone. The labels always track the array.
 * For **`one-max`** the saving step uses `arr.max(axis=1)` instead of
   `arr[:, k]`: axis 1 is `C`, so it collapses the channels too.
-* For **`as-nd2`** the whole `(T, C, Y, X)` array is written as one series per
-  position instead of being split.
+* For **`as-nd2`** and **`as-nd2-color`** the whole `(T, C, Y, X)` array is
+  written as one series per position instead of being split. The only
+  difference is that `as-nd2-color` adds `chan["Color"] = [ome_color(c) ...]`
+  to the metadata. The pixel numbers are identical in both modes.
 
 ### The "jobs" list
 
@@ -842,7 +901,7 @@ ones are recognized.
 
 ### Why a `try` / `finally` around the loop
 
-If anything crashes mid-way in `as-nd2` mode, `finally` still runs
+If anything crashes mid-way in an OME mode (`as-nd2` / `as-nd2-color`), `finally` still runs
 `writer.close()`, so the half-written file is closed properly rather than
 left locked or corrupt.
 
@@ -931,6 +990,6 @@ with `.max(axis=...)`, loads the small result into memory, standardizes the
 axes to `T, C, Y, X`, and then writes it according to `--mode`: tinted and
 merged into an 8-bit color picture (`simple`), max-ed over channels
 (`one-max`), split per channel (`multi-max`), or kept whole as one series of
-an OME-TIFF (`as-nd2`). File names are assembled by `build_name()` from a run
+an OME-TIFF (`as-nd2`, or `as-nd2-color` which also stores each channel's color). File names are assembled by `build_name()` from a run
 counter, the file name, the position, and the channel, cleaned by
 `safe_name()` so Windows accepts them.

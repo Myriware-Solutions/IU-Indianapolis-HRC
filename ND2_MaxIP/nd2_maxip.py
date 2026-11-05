@@ -23,6 +23,11 @@ Modes:
                 available library, so this is saved as an OME-TIFF
                 (<name>_maxip.ome.tif), which Fiji/ImageJ and Bio-Formats
                 based tools open with the positions as separate series.
+    as-nd2-color
+                Same as as-nd2 (<name>_maxip_color.ome.tif), but each
+                channel's color is stored in the file, so viewers that read
+                OME color (Fiji/Bio-Formats) show every channel in its color.
+                The pixel values stay original-bit-depth intensities.
 
 File names:
     <index>_<nd2 name>_P<position #>_<position name>[_C<channel #>_<channel name>].tif
@@ -68,9 +73,9 @@ NAMED_COLORS = {
 }
 
 
-def parse_colors(text):
+def parse_colors(text:str) -> list[tuple[int,...]]:
     """'blue,red' or '#0000ff,#ff0000' -> [(r,g,b), ...]"""
-    out = []
+    out:list[tuple[int,...]] = []
     for tok in text.split(","):
         tok = tok.strip().lower()
         if tok in NAMED_COLORS:
@@ -133,7 +138,7 @@ def make_rgb(arr, order, colors, lo_pct, hi_pct):
     return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
-def position_names(f, n_points):
+def position_names(f:nd2.ND2File, n_points:int):
     """Names of the multipoint positions, in order (list of str; '' if
     a position has no name)."""
     names = []
@@ -151,7 +156,7 @@ def position_names(f, n_points):
     return names or [""] * n_points
 
 
-def safe_name(name, max_len=80):
+def safe_name(name:str, max_len=80):
     """Make a position name safe for use in a file name (Windows-safe)."""
     cleaned = "".join("_" if (c in '<>:"/\\|?*' or ord(c) < 32) else c
                       for c in name.strip())
@@ -159,10 +164,22 @@ def safe_name(name, max_len=80):
     return cleaned.strip("._")[:max_len]
 
 
-def channel_names(f, n):
+OME_MODES = ("as-nd2", "as-nd2-color")
+
+
+def ome_color(rgb:tuple[int,int,int]):
+    """(R, G, B) 0-255 -> the signed 32-bit RGBA integer OME-XML expects
+    (red in the top byte, alpha 255 in the lowest)."""
+    r, g, b = (int(v) for v in rgb)
+    v = (r << 24) | (g << 16) | (b << 8) | 255
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+def channel_names(f:nd2.ND2File, n:int):
     """Channel names from the ND2 metadata ('' where missing)."""
     names = []
     try:
+        assert f.metadata.channels
         names = [(ch.channel.name or "") for ch in f.metadata.channels[:n]]
     except Exception as e:
         print(f"  WARNING: could not read channel names ({e!r})")
@@ -222,9 +239,19 @@ def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
         pos_names = position_names(f, n_points)
         ch_names = channel_names(f, n_c)
 
+        ome_mode = mode in OME_MODES
+        ome_colors = None
+        if mode == "as-nd2-color":
+            ome_colors = override_colors or channel_colors(f, n_c)
+            if len(ome_colors) < n_c:
+                raise ValueError(f"--colors gave {len(ome_colors)} colors "
+                                 f"but the file has {n_c} channels")
+
         writer = None
-        if mode == "as-nd2":
-            ome_out = outdir / f"{next(counter):04d}_{path.stem}_maxip.ome.tif"
+        if ome_mode:
+            tag = "_color" if mode == "as-nd2-color" else ""
+            ome_out = outdir / (f"{next(counter):04d}_{path.stem}_maxip"
+                                f"{tag}.ome.tif")
             if ome_out.exists() and not overwrite:
                 print(f"  skip {ome_out.name} (exists; use --overwrite)")
                 return
@@ -257,7 +284,7 @@ def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
                         print(f"  skip {job[0].name} (exists; use --overwrite)")
                     else:
                         todo.append(job)
-                if mode != "as-nd2" and not todo:
+                if not ome_mode and not todo:
                     continue
 
                 # ---- max-IP over Z for this position -------------------
@@ -278,13 +305,16 @@ def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
                     raise ValueError(f"unexpected axes {order} after max-IP")
 
                 # ---- write -----------------------------------------------
-                if mode == "as-nd2":
+                if ome_mode:
+                    chan = {"Name": [f"C{c + 1}" + (f"_{n}" if n else "")
+                                     for c, n in enumerate(ch_names)]}
+                    if ome_colors:
+                        chan["Color"] = [ome_color(c) for c in
+                                         ome_colors[:n_c]]
                     meta = {"axes": "".join(order),
                             "Name": (f"P{p + 1:03d}_{pos_names[p]}"
                                      if pos_names[p] else f"P{p + 1:03d}"),
-                            "Channel": {"Name": [
-                                f"C{c + 1}" + (f"_{n}" if n else "")
-                                for c, n in enumerate(ch_names)]}}
+                            "Channel": chan}
                     if px_x and px_y:
                         meta.update(PhysicalSizeX=px_x, PhysicalSizeY=px_y,
                                     PhysicalSizeXUnit="µm",
@@ -327,12 +357,15 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="+", help=".nd2 files and/or folders")
     ap.add_argument("--mode", required=True,
-                    choices=["simple", "one-max", "multi-max", "as-nd2"],
+                    choices=["simple", "one-max", "multi-max", "as-nd2",
+                             "as-nd2-color"],
                     help="REQUIRED. simple: color RGB for presentations; "
                          "one-max: one intensity TIFF per position (all "
                          "channels combined); multi-max: one intensity TIFF "
                          "per position per channel; as-nd2: one multi-"
-                         "position, multi-channel file per .nd2 (OME-TIFF)")
+                         "position, multi-channel file per .nd2 (OME-TIFF); "
+                         "as-nd2-color: same, with each channel's color "
+                         "stored in the file")
     ap.add_argument("-o", "--outdir", default=None,
                     help="output folder (default: next to each input file)")
     ap.add_argument("--overwrite", action="store_true")
@@ -341,24 +374,26 @@ def main():
     ap.add_argument("--high", type=float, default=99.8,
                     help="simple mode: high contrast percentile (default 99.8)")
     ap.add_argument("--colors", default=None,
-                    help="simple mode: override channel colors, in channel "
+                    help="simple / as-nd2-color mode: override channel colors, in channel "
                          "order, e.g. blue,red or '#0000ff,#ff0000'. Names: "
                          + ", ".join(NAMED_COLORS))
     args = ap.parse_args()
 
-    if args.mode != "simple" and (args.colors or args.low != 0.5
-                                  or args.high != 99.8):
-        print("Note: --colors/--low/--high only apply to --mode simple.",
+    if args.mode not in ("simple", "as-nd2-color") and args.colors:
+        print("Note: --colors only applies to --mode simple and "
+              "as-nd2-color.", file=sys.stderr)
+    if args.mode != "simple" and (args.low != 0.5 or args.high != 99.8):
+        print("Note: --low/--high only apply to --mode simple.",
               file=sys.stderr)
 
-    override = None
+    override:list[tuple[int,...]]|None = None
     if args.colors:
         try:
             override = parse_colors(args.colors)
         except ValueError as e:
             sys.exit(str(e))
 
-    files = []
+    files:list[Path] = []
     for item in args.inputs:
         p = Path(item)
         if p.is_dir():
