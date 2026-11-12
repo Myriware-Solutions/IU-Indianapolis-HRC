@@ -13,7 +13,8 @@ Usage (--mode is required):
 
 Modes:
     simple      8-bit color RGB TIFF for presentations (one per position),
-                channels tinted with their ND2 colors.
+                channels tinted with their ND2 colors. Fixed brightness scale
+                (no auto-contrast) unless --low and/or --high are given.
     one-max     One intensity TIFF per position: max-IP over Z and over all
                 channels (original bit depth).
     multi-max   One intensity TIFF per position per channel: max-IP over Z
@@ -73,9 +74,9 @@ NAMED_COLORS = {
 }
 
 
-def parse_colors(text:str) -> list[tuple[int,...]]:
+def parse_colors(text):
     """'blue,red' or '#0000ff,#ff0000' -> [(r,g,b), ...]"""
-    out:list[tuple[int,...]] = []
+    out = []
     for tok in text.split(","):
         tok = tok.strip().lower()
         if tok in NAMED_COLORS:
@@ -113,8 +114,12 @@ def channel_colors(f, n):
     return [DEFAULT_COLORS[i % len(DEFAULT_COLORS)] for i in range(n)]
 
 
+DEFAULT_LOW_PCT = 0.5    # used for --low  when only --high is given
+DEFAULT_HIGH_PCT = 99.8  # used for --high when only --low is given
+
+
 def stretch(a, lo_pct, hi_pct):
-    """Contrast-stretch to 0..1 using percentiles."""
+    """Contrast-stretch to 0..1 using percentiles (auto-contrast)."""
     a = a.astype(np.float32)
     lo, hi = np.percentile(a, (lo_pct, hi_pct))
     if hi <= lo:
@@ -122,23 +127,57 @@ def stretch(a, lo_pct, hi_pct):
     return np.clip((a - lo) / (hi - lo), 0.0, 1.0)
 
 
-def make_rgb(arr, order, colors, lo_pct, hi_pct):
+def to_unit(a, lo_pct, hi_pct, full_max):
+    """Scale intensities to 0..1.
+
+    Default (lo_pct and hi_pct both None): a FIXED linear scale, 0 -> black
+    and full_max -> full brightness, the same for every channel and image.
+    Nothing is adapted to the data, so background noise stays dark.
+
+    If --low and/or --high were given: percentile auto-contrast (stretch),
+    with whichever one was left out using its default."""
+    if lo_pct is None and hi_pct is None:
+        return np.clip(a.astype(np.float32) / full_max, 0.0, 1.0)
+    return stretch(a,
+                   DEFAULT_LOW_PCT if lo_pct is None else lo_pct,
+                   DEFAULT_HIGH_PCT if hi_pct is None else hi_pct)
+
+
+def full_scale_max(f, dtype):
+    """Brightest value the detector can record, e.g. 4095 for 12-bit data
+    stored in 16-bit numbers. Read from the ND2; falls back to the data
+    type's maximum (65535 for uint16). Returns None for float data."""
+    if not np.issubdtype(dtype, np.integer):
+        return None
+    type_bits = np.iinfo(dtype).bits
+    try:
+        bits = int(f.attributes.bitsPerComponentSignificant)
+    except Exception:
+        bits = type_bits
+    if not 0 < bits <= type_bits:
+        bits = type_bits
+    return float(2 ** bits - 1)
+
+
+def make_rgb(arr, order, colors, lo_pct, hi_pct, full_max=None):
     """arr is T,C,Y,X (or T,C,Y,X,S). Returns uint8 array (T, Y, X, 3) with
     each channel tinted by its color and summed (like a Fiji composite)."""
+    if full_max is None:  # float data: use the brightest value present
+        full_max = max(float(arr.max()), 1e-9)
     if "S" in order:  # camera RGB data: already color
         a = arr[:, 0, :, :, :3]
         if a.dtype != np.uint8:
-            a = (stretch(a, lo_pct, hi_pct) * 255 + 0.5).astype(np.uint8)
+            a = (to_unit(a, lo_pct, hi_pct, full_max) * 255 + 0.5).astype(np.uint8)
         return a
     T, C, Y, X = arr.shape
     out = np.zeros((T, Y, X, 3), np.float32)
     for c in range(C):
-        out += stretch(arr[:, c], lo_pct, hi_pct)[..., None] * (
+        out += to_unit(arr[:, c], lo_pct, hi_pct, full_max)[..., None] * (
             np.array(colors[c], np.float32) / 255.0)
     return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
-def position_names(f:nd2.ND2File, n_points:int):
+def position_names(f, n_points):
     """Names of the multipoint positions, in order (list of str; '' if
     a position has no name)."""
     names = []
@@ -156,7 +195,7 @@ def position_names(f:nd2.ND2File, n_points:int):
     return names or [""] * n_points
 
 
-def safe_name(name:str, max_len=80):
+def safe_name(name, max_len=80):
     """Make a position name safe for use in a file name (Windows-safe)."""
     cleaned = "".join("_" if (c in '<>:"/\\|?*' or ord(c) < 32) else c
                       for c in name.strip())
@@ -167,7 +206,7 @@ def safe_name(name:str, max_len=80):
 OME_MODES = ("as-nd2", "as-nd2-color")
 
 
-def ome_color(rgb:tuple[int,int,int]):
+def ome_color(rgb):
     """(R, G, B) 0-255 -> the signed 32-bit RGBA integer OME-XML expects
     (red in the top byte, alpha 255 in the lowest)."""
     r, g, b = (int(v) for v in rgb)
@@ -175,11 +214,10 @@ def ome_color(rgb:tuple[int,int,int]):
     return v - (1 << 32) if v >= (1 << 31) else v
 
 
-def channel_names(f:nd2.ND2File, n:int):
+def channel_names(f, n):
     """Channel names from the ND2 metadata ('' where missing)."""
     names = []
     try:
-        assert f.metadata.channels
         names = [(ch.channel.name or "") for ch in f.metadata.channels[:n]]
     except Exception as e:
         print(f"  WARNING: could not read channel names ({e!r})")
@@ -219,7 +257,7 @@ def write_intensity(path, arr, px_x, px_y, has_s=False):
 
 
 def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
-                 counter, lo_pct: float = 0.5, hi_pct: float = 99.8,
+                 counter, lo_pct=None, hi_pct=None,
                  override_colors=None):
     outdir.mkdir(parents=True, exist_ok=True)
     with nd2.ND2File(str(path)) as f:
@@ -238,6 +276,17 @@ def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
         n_c = f.sizes.get("C", 1)
         pos_names = position_names(f, n_points)
         ch_names = channel_names(f, n_c)
+
+        full_max = full_scale_max(f, data.dtype)
+        if mode == "simple":
+            if lo_pct is None and hi_pct is None:
+                print("  contrast: fixed scale 0 to "
+                      f"{full_max:g}" if full_max else
+                      "  contrast: fixed scale (float data)", "(no auto-contrast)")
+            else:
+                print("  contrast: percentile auto-contrast "
+                      f"{DEFAULT_LOW_PCT if lo_pct is None else lo_pct:g} to "
+                      f"{DEFAULT_HIGH_PCT if hi_pct is None else hi_pct:g}")
 
         ome_mode = mode in OME_MODES
         ome_colors = None
@@ -331,7 +380,8 @@ def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
                             raise ValueError(
                                 f"--colors gave {len(colors)} colors but "
                                 f"the file has {n_c} channels")
-                        rgb = make_rgb(arr, order, colors, lo_pct, hi_pct)
+                        rgb = make_rgb(arr, order, colors, lo_pct, hi_pct,
+                                       full_max)
                         res = {}
                         if px_x and px_y:
                             res = {"resolution": (1.0 / px_x, 1.0 / px_y),
@@ -369,10 +419,15 @@ def main():
     ap.add_argument("-o", "--outdir", default=None,
                     help="output folder (default: next to each input file)")
     ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--low", type=float, default=0.5,
-                    help="simple mode: low contrast percentile (default 0.5)")
-    ap.add_argument("--high", type=float, default=99.8,
-                    help="simple mode: high contrast percentile (default 99.8)")
+    ap.add_argument("--low", type=float, default=None,
+                    help="simple mode: turn ON auto-contrast and set the low "
+                         "percentile (default if only --high is given: "
+                         f"{DEFAULT_LOW_PCT:g}). Without --low/--high, images "
+                         "use a fixed, unadjusted brightness scale.")
+    ap.add_argument("--high", type=float, default=None,
+                    help="simple mode: turn ON auto-contrast and set the high "
+                         "percentile (default if only --low is given: "
+                         f"{DEFAULT_HIGH_PCT:g})")
     ap.add_argument("--colors", default=None,
                     help="simple / as-nd2-color mode: override channel colors, in channel "
                          "order, e.g. blue,red or '#0000ff,#ff0000'. Names: "
@@ -382,18 +437,19 @@ def main():
     if args.mode not in ("simple", "as-nd2-color") and args.colors:
         print("Note: --colors only applies to --mode simple and "
               "as-nd2-color.", file=sys.stderr)
-    if args.mode != "simple" and (args.low != 0.5 or args.high != 99.8):
+    if args.mode != "simple" and (args.low is not None
+                                  or args.high is not None):
         print("Note: --low/--high only apply to --mode simple.",
               file=sys.stderr)
 
-    override:list[tuple[int,...]]|None = None
+    override = None
     if args.colors:
         try:
             override = parse_colors(args.colors)
         except ValueError as e:
             sys.exit(str(e))
 
-    files:list[Path] = []
+    files = []
     for item in args.inputs:
         p = Path(item)
         if p.is_dir():
