@@ -79,7 +79,7 @@ docstring            <- the """ ... """ block: the help text at the top
 imports              <- load the libraries we depend on
 constants            <- OUT_ORDER, DEFAULT_COLORS, NAMED_COLORS (values that never change)
 helper functions     <- small single-purpose tools
-    reorder, parse_colors, channel_colors, stretch, make_rgb,
+    reorder, parse_colors, channel_colors, stretch, to_unit, full_scale_max, make_rgb,
     position_names, safe_name, channel_names, build_name, write_intensity
 process_file()       <- the main worker: handles ONE .nd2 file
 main()               <- reads your command, finds files, calls process_file for each
@@ -109,7 +109,9 @@ python nd2_maxip.py file.nd2 --mode multi-max
         ├── reorder()             put axes in a known order
         ├── channel_colors()      (simple mode) read channel colors
         ├── make_rgb()            (simple mode) merge channels into one color image
-        │       └── stretch()     (simple mode) adjust contrast
+        ├── full_scale_max()      (simple mode) the camera's brightest possible value
+        │       └── to_unit()     (simple mode) scale brightness to 0..1
+        │             └── stretch()   only if --low/--high were given (auto-contrast)
         └── write_intensity()     (one-max / multi-max) save a TIFF
 ```
 
@@ -144,7 +146,7 @@ lines from the file.
 | `==` | **is equal to?** (asks a question, gives True/False) | `if mode == "simple":` |
 | `!=` | **is not equal to?** | `args.mode != "simple"` |
 | `<=`, `>=`, `<`, `>` | less/greater than (or equal) | `if hi <= lo:` |
-| `+=` | add to the existing value: `x += 1` means `x = x + 1` | `out += stretch(...)` |
+| `+=` | add to the existing value: `x += 1` means `x = x + 1` | `out += to_unit(...)` |
 | `+` | add numbers, **or join** strings/lists | `suffix + ".tif"`, `[ax] + dims` |
 | `*` | multiply numbers; also **repeat** a sequence: `[""] * 3` gives `["", "", ""]` | `[""] * n_points` |
 | `/` | divide (always gives a decimal). **With Paths** it means "join the path": `outdir / "file.tif"` | `1.0 / px_x`, `outdir / build_name(...)` |
@@ -235,7 +237,7 @@ Python counts from **0**. `names[0]` is the first item, `names[1]` the second.
 
 ```python
 def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
-                 counter, lo_pct: float = 0.5, hi_pct: float = 99.8,
+                 counter, lo_pct=None, hi_pct=None,
                  override_colors=None):
 ```
 
@@ -243,8 +245,9 @@ def process_file(path: Path, outdir: Path, overwrite: bool, mode: str,
   **parameters** (the inputs it needs).
 * `path: Path` is a **type hint**: a note that `path` should be a `Path`.
   Python does not enforce it; it is documentation.
-* `lo_pct: float = 0.5` gives a **default value**. If the caller leaves it
-  out, `0.5` is used. Parameters with defaults must come after those without.
+* `lo_pct=None` gives a **default value**. If the caller leaves it out,
+  `None` ("no value") is used, and the code treats that as "auto-contrast is
+  off". Parameters with defaults must come after those without.
 * **Positional vs keyword arguments.** `build_name(3, "exp1", 1, "Control")`
   matches by position. `build_name(..., ch=0, suffix="_max")` matches by
   **name**, so the order of keyword arguments does not matter.
@@ -617,10 +620,36 @@ metadata, falling back to defaults.
 
 ---
 
+### `full_scale_max(f, dtype)`
+
+**Purpose:** find the brightest value the detector can possibly record, so
+brightness can be measured against a fixed yardstick.
+
+Microscope cameras often record 12 bits (values 0 to 4095) but store them in
+16-bit numbers (which could go to 65535). The ND2 file knows the real bit
+depth: `f.attributes.bitsPerComponentSignificant`. The function returns
+`2 ** bits - 1` (`**` means "to the power of"): 4095 for 12-bit, 65535 for
+16-bit.
+
+* `np.issubdtype(dtype, np.integer)` asks "are these whole numbers?" If the
+  data are decimals (float), it returns `None` and `make_rgb` falls back to the
+  brightest value present.
+* The `try / except` covers files with no such attribute: it then uses the
+  data type's own maximum (`np.iinfo(dtype).bits` gives 16 for uint16).
+* `if not 0 < bits <= type_bits:` is a **chained comparison** (Python allows
+  `0 < bits <= 16`): it rejects nonsense values and falls back to the type's
+  maximum.
+
+Verified: 12-bit gives 4095, 16-bit gives 65535, uint8 gives 255, float gives
+`None`, and a bogus value (24 bits in a 16-bit container) falls back to 65535.
+
+---
+
 ### `stretch(a, lo_pct, hi_pct)`
 
-**Purpose:** rescale brightness so the picture is visible. Turns any range of
-numbers into the range 0 to 1.
+**Purpose:** *auto-contrast.* Rescale brightness to the range 0 to 1 using the
+image's **own** brightest and darkest values. This is only used if you give
+`--low` and/or `--high`.
 
 ```python
 a = a.astype(np.float32)                         # decimals, so we can do math
@@ -635,15 +664,50 @@ The formula `(a - lo) / (hi - lo)` is a straight-line remap: `lo` becomes 0,
 anything outside (the very dark and very bright tails) to 0 or 1.
 
 Why percentiles instead of min and max? One hot pixel would otherwise set the
-white point and make the whole image look dim. Using the 0.5th and 99.8th
-percentiles (the defaults) ignores the extreme tails. Example with the values
+white point and make the whole image look dim. Example with the values
 `[0, 10, 20, 30, 40, 1000]` and percentiles `(0, 100)`: the result is
-`[0, 0.01, 0.02, 0.03, 0.04, 1.0]`. The one outlier (1000) dominates, which is
-exactly the problem that `--high 99.8` avoids on real images.
+`[0, 0.01, 0.02, 0.03, 0.04, 1.0]`. The one outlier (1000) dominates; using
+percentiles such as 99.8 instead of 100 ignores the extreme tail.
+
+**The catch: this is why it is off by default.** `stretch` adapts to whatever
+is in each channel. If a channel contains almost no real signal (just
+background noise), its "white point" is set by the noise, so the noise is
+stretched all the way up to full brightness. That shows up as a colored haze
+(for example green, then yellow where it overlaps red) over the whole image,
+including over the real structures of the other channels. A **fixed scale**
+(`to_unit` below) does not do this: noise that is 2% of the camera's range
+stays at 2%.
 
 ---
 
-### `make_rgb(arr, order, colors, lo_pct, hi_pct)`
+### `to_unit(a, lo_pct, hi_pct, full_max)`
+
+**Purpose:** the one place that decides *how* brightness becomes 0..1.
+
+```python
+if lo_pct is None and hi_pct is None:
+    return np.clip(a.astype(np.float32) / full_max, 0.0, 1.0)
+return stretch(a, DEFAULT_LOW_PCT if lo_pct is None else lo_pct,
+                  DEFAULT_HIGH_PCT if hi_pct is None else hi_pct)
+```
+
+* **Default (both `None`):** divide by `full_max`. 0 is black, `full_max` is
+  full brightness, for every channel and every image, so images are comparable
+  and background noise stays dark. This is simple division, with `np.clip`
+  guarding against rounding past 1.
+* **If you gave `--low` and/or `--high`:** call `stretch`. Whichever one you
+  left out is filled in with its default (`DEFAULT_LOW_PCT = 0.5` or
+  `DEFAULT_HIGH_PCT = 99.8`) using the one-line `x if condition else y`.
+* `is None` is the proper way to test for "no value". (We do not use `== 0`
+  because `--low 0` is a legitimate request and must not be treated as
+  "not given".)
+
+The trade-off: a fixed scale shows data *as recorded*, so a dim image looks
+dim. Use `--high` (for example `--high 99.9`) if you want it brightened.
+
+---
+
+### `make_rgb(arr, order, colors, lo_pct, hi_pct, full_max=None)`
 
 **Purpose:** build the presentation picture for `simple` mode: merge channels
 into one color image.
@@ -652,7 +716,7 @@ into one color image.
 T, C, Y, X = arr.shape
 out = np.zeros((T, Y, X, 3), np.float32)       # blank color image, all black
 for c in range(C):                             # one channel at a time
-    out += stretch(arr[:, c], lo_pct, hi_pct)[..., None] * (
+    out += to_unit(arr[:, c], lo_pct, hi_pct, full_max)[..., None] * (
         np.array(colors[c], np.float32) / 255.0)
 return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
 ```
@@ -660,7 +724,7 @@ return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
 Read the middle line from the inside out:
 
 1. `arr[:, c]`: channel `c` for all time points, shape `(T, Y, X)`.
-2. `stretch(...)`: brightness remapped to 0..1.
+2. `to_unit(...)`: brightness scaled to 0..1 (fixed scale by default; auto-contrast if `--low`/`--high` were given).
 3. `[..., None]`: add a trailing length-1 axis, shape `(T, Y, X, 1)`.
 4. `np.array(colors[c]) / 255.0`: the color as fractions, e.g. blue
    `(0, 0, 255)` becomes `(0.0, 0.0, 1.0)`, shape `(3,)`.
@@ -925,8 +989,10 @@ and undo it if it breaks. This is the fastest way to learn.
    ```
    Seeing the real objects makes the rest of the code much less abstract.
 
-2. **Change the contrast.** In `main`, change the default `--high` from `99.8`
-   to `99.0`, run `--mode simple` on the same file, and compare.
+2. **Compare contrast settings.** Run `--mode simple` on the same file three
+   times with different options: none, `--high 99.9`, and `--low 1 --high 99`.
+   (Add `-o` with a different folder each time, or `--overwrite`.) Then, in
+   `DEFAULT_HIGH_PCT`, change `99.8` to `99.0` and run with only `--low 1`.
 
 3. **Change how files are named.** In `build_name`, change `f"P{p + 1:03d}"` to
    `f"Pos{p + 1:02d}"`. Run and look at the names.
